@@ -1,7 +1,8 @@
 import sys
 import os
+import json
+import hashlib
 import threading
-import time
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QTabWidget, QLabel, QLineEdit, QPushButton, QCheckBox, 
@@ -15,7 +16,7 @@ class WorkerSignals(QObject):
     log_signal = pyqtSignal(str)
     toggle_ui_signal = pyqtSignal(bool)
     clear_inputs_signal = pyqtSignal(str)
-    overwrite_request = pyqtSignal(str, object) 
+    overwrite_request = pyqtSignal(str, object, object) 
 
 class SecureVaultPyQt(QMainWindow):
     def __init__(self):
@@ -23,7 +24,9 @@ class SecureVaultPyQt(QMainWindow):
         self.encryptor = FileEncryptor()
         self.signals = WorkerSignals()
         
-        self.failed_attempts = {}
+        self._attempts_lock = threading.Lock()
+        self._attempts_file = os.path.join(os.path.expanduser("~"), ".securevault_attempts.json")
+        self.failed_attempts = self._load_failed_attempts()
         
         self.signals.log_signal.connect(self.log)
         self.signals.toggle_ui_signal.connect(self.toggle_ui)
@@ -347,6 +350,7 @@ class SecureVaultPyQt(QMainWindow):
             self.enc_output_input.clear()
             self.enc_pass_input.clear()
             self.enc_conf_input.clear()
+            self.shred_checkbox.setChecked(False)
         elif engine == "dec":
             self.dec_target_input.clear()
             self.dec_output_input.clear()
@@ -358,17 +362,57 @@ class SecureVaultPyQt(QMainWindow):
             self.rsa_dec_target.clear()
             self.rsa_priv_key.clear()
 
-    def prompt_overwrite_sync(self, path, container_list):
-        reply = QMessageBox.question(
-            self, 'Overwrite System Check',
-            f"The target item '{os.path.basename(path)}' already exists.\n\nOverwrite it?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
-        )
-        container_list.append(reply == QMessageBox.StandardButton.Yes)
+    def _load_failed_attempts(self) -> dict:
+        try:
+            if os.path.isfile(self._attempts_file):
+                with open(self._attempts_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return {str(k): int(v) for k, v in data.items()}
+        except Exception:
+            pass
+        return {}
+
+    def _save_failed_attempts(self):
+        try:
+            with open(self._attempts_file, "w", encoding="utf-8") as f:
+                json.dump(self.failed_attempts, f)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _attempt_key(target: str) -> str:
+        norm_path = os.path.normcase(os.path.abspath(target))
+        try:
+            with open(target, "rb") as f:
+                header = f.read(28)
+            if len(header) == 28:
+                return f"hdr:{hashlib.sha256(header).hexdigest()}"
+        except OSError:
+            pass
+        return f"path:{norm_path}"
+
+    def prompt_overwrite_sync(self, path, container_list, done_event):
+        try:
+            reply = QMessageBox.question(
+                self, 'Overwrite System Check',
+                f"The target item '{os.path.basename(path)}' already exists.\n\nOverwrite it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
+            )
+            container_list.append(reply == QMessageBox.StandardButton.Yes)
+        finally:
+            done_event.set()
+
+    def _thread_safe_overwrite_check(self, out_path: str) -> bool:
+        result_container = []
+        done_event = threading.Event()
+        self.signals.overwrite_request.emit(out_path, result_container, done_event)
+        done_event.wait()
+        return bool(result_container and result_container[0])
 
     # --- TAB 1 THREADS (LOCAL ENCRYPT) ---
     def start_encryption_thread(self):
-        target = self.enc_target_input.text()
+        target = self.enc_target_input.text().strip()
         custom_out = self.enc_output_input.text().strip() or None
         pwd = self.enc_pass_input.text()
         conf = self.enc_conf_input.text()
@@ -384,7 +428,8 @@ class SecureVaultPyQt(QMainWindow):
             self.log("[-] Error: Network/Local target path resolution failure.")
             return
 
-        expected_out = custom_out if custom_out else (f"{target}.zip.enc" if os.path.isdir(target) else f"{target}.enc")
+        target_norm = os.path.normpath(target)
+        expected_out = custom_out if custom_out else (f"{target_norm}.zip.enc" if os.path.isdir(target_norm) else f"{target_norm}.enc")
         if os.path.exists(expected_out):
             reply = QMessageBox.question(
                 self, 'Overwrite Check', f"Archive '{os.path.basename(expected_out)}' already exists.\n\nOverwrite?",
@@ -395,7 +440,7 @@ class SecureVaultPyQt(QMainWindow):
                 return
 
         self.toggle_ui(False)
-        threading.Thread(target=self._exec_encryption, args=(target, pwd, shred, custom_out), daemon=True).start()
+        threading.Thread(target=self._exec_encryption, args=(target_norm, pwd, shred, custom_out), daemon=True).start()
 
     def _exec_encryption(self, target, pwd, shred, custom_out):
         try:
@@ -420,40 +465,36 @@ class SecureVaultPyQt(QMainWindow):
 
     # --- TAB 2 THREADS (LOCAL DECRYPT) ---
     def start_decryption_thread(self):
-        target = self.dec_target_input.text()
+        target = self.dec_target_input.text().strip()
         custom_out = self.dec_output_input.text().strip() or None
         pwd = self.dec_pass_input.text()
 
         if not target or not pwd:
             self.log("[-] Error: Target payload and verification tokens required.")
             return
-        if not os.path.exists(target):
-            self.log("[-] Error: Target resolved to null.")
+        if not os.path.isfile(target):
+            self.log("[-] Error: Target file does not exist or is not a valid file.")
             return
 
         self.toggle_ui(False)
         threading.Thread(target=self._exec_decryption, args=(target, pwd, custom_out), daemon=True).start()
 
     def _exec_decryption(self, target, pwd, custom_out):
+        attempt_key = self._attempt_key(target)
         try:
             self.signals.log_signal.emit(f"Passing crypt-stream parameters for: {os.path.basename(target)}")
-            
-            def thread_safe_overwrite_check(out_path):
-                result_container = []
-                self.signals.overwrite_request.emit(out_path, result_container)
-                while not result_container:
-                    time.sleep(0.05)
-                return result_container[0]
 
             if target.endswith('.zip.enc'):
-                out = self.encryptor.decrypt_directory(target, pwd, output_path=custom_out, overwrite_callback=thread_safe_overwrite_check)
+                out = self.encryptor.decrypt_directory(target, pwd, output_path=custom_out, overwrite_callback=self._thread_safe_overwrite_check)
             else:
-                out = self.encryptor.decrypt_file(target, pwd, output_path=custom_out, overwrite_callback=thread_safe_overwrite_check)
+                out = self.encryptor.decrypt_file(target, pwd, output_path=custom_out, overwrite_callback=self._thread_safe_overwrite_check)
                 
             self.signals.log_signal.emit(f"[+] Decrypted sequence output success: {os.path.basename(out)}")
             
-            if target in self.failed_attempts:
-                del self.failed_attempts[target]
+            with self._attempts_lock:
+                if attempt_key in self.failed_attempts:
+                    del self.failed_attempts[attempt_key]
+                    self._save_failed_attempts()
                 
             self.signals.clear_inputs_signal.emit("dec")
             
@@ -461,8 +502,10 @@ class SecureVaultPyQt(QMainWindow):
             self.signals.log_signal.emit(f"[-] Operation Aborted: {str(ie)}")
         except ValueError as ve:
             if "signature verification failed" in str(ve).lower():
-                attempts = self.failed_attempts.get(target, 0) + 1
-                self.failed_attempts[target] = attempts
+                with self._attempts_lock:
+                    attempts = self.failed_attempts.get(attempt_key, 0) + 1
+                    self.failed_attempts[attempt_key] = attempts
+                    self._save_failed_attempts()
                 
                 remaining = 5 - attempts
                 if remaining > 0:
@@ -474,7 +517,9 @@ class SecureVaultPyQt(QMainWindow):
                         self.signals.log_signal.emit(f"[!] Target '{os.path.basename(target)}' securely shredded from disk.")
                     except Exception as e:
                         self.signals.log_signal.emit(f"[-] Shredder execution failed: {e}")
-                    del self.failed_attempts[target]
+                    with self._attempts_lock:
+                        self.failed_attempts.pop(attempt_key, None)
+                        self._save_failed_attempts()
             else:
                 self.signals.log_signal.emit(f"[-] Authentication Failure: {ve}")
         except Exception as e:
@@ -488,6 +533,19 @@ class SecureVaultPyQt(QMainWindow):
         save_dir = QFileDialog.getExistingDirectory(self, "Select Folder to Save Keys", options=options)
         if not save_dir:
             return
+
+        priv_path = os.path.join(save_dir, "my_private_key.pem")
+        pub_path = os.path.join(save_dir, "my_public_key.pem")
+        if os.path.exists(priv_path) or os.path.exists(pub_path):
+            reply = QMessageBox.question(
+                self, 'Overwrite Existing Keys',
+                "An existing RSA keypair was found in this folder.\n\n"
+                "Overwriting your private key will permanently prevent decryption of older files.\n\nOverwrite?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                self.log("[-] Key generation aborted to preserve existing keys.")
+                return
             
         self.toggle_ui(False)
         threading.Thread(target=self._exec_rsa_keygen, args=(save_dir,), daemon=True).start()
@@ -508,12 +566,28 @@ class SecureVaultPyQt(QMainWindow):
             self.signals.toggle_ui_signal.emit(True)
 
     def start_rsa_encrypt_thread(self):
-        target = self.rsa_enc_target.text()
-        pub_key = self.rsa_pub_key.text()
+        target = self.rsa_enc_target.text().strip()
+        pub_key = self.rsa_pub_key.text().strip()
         
         if not target or not pub_key:
             self.log("[-] Error: Missing Target File or Recipient's Public Key.")
             return
+        if not os.path.isfile(target):
+            self.log("[-] Error: Target file does not exist or is not a valid file.")
+            return
+        if not os.path.isfile(pub_key):
+            self.log("[-] Error: Recipient's Public Key file does not exist.")
+            return
+
+        expected_out = f"{target}.rsa.enc"
+        if os.path.exists(expected_out):
+            reply = QMessageBox.question(
+                self, 'Overwrite Check', f"Package '{os.path.basename(expected_out)}' already exists.\n\nOverwrite?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                self.log("[-] Aborted to protect existing RSA package.")
+                return
             
         self.toggle_ui(False)
         threading.Thread(target=self._exec_rsa_encrypt, args=(target, pub_key), daemon=True).start()
@@ -530,11 +604,17 @@ class SecureVaultPyQt(QMainWindow):
             self.signals.toggle_ui_signal.emit(True)
 
     def start_rsa_decrypt_thread(self):
-        target = self.rsa_dec_target.text()
-        priv_key = self.rsa_priv_key.text()
+        target = self.rsa_dec_target.text().strip()
+        priv_key = self.rsa_priv_key.text().strip()
         
         if not target or not priv_key:
             self.log("[-] Error: Missing Encrypted Package or your Private Key.")
+            return
+        if not os.path.isfile(target):
+            self.log("[-] Error: Encrypted package file does not exist.")
+            return
+        if not os.path.isfile(priv_key):
+            self.log("[-] Error: Private Key file does not exist.")
             return
             
         self.toggle_ui(False)
@@ -543,15 +623,7 @@ class SecureVaultPyQt(QMainWindow):
     def _exec_rsa_decrypt(self, target, priv_key):
         try:
             self.signals.log_signal.emit(f"[*] Unlocking envelope with your Private Key: {os.path.basename(target)}")
-            
-            def thread_safe_overwrite_check(out_path):
-                result_container = []
-                self.signals.overwrite_request.emit(out_path, result_container)
-                while not result_container:
-                    time.sleep(0.05)
-                return result_container[0]
-                
-            out = self.encryptor.rsa_decrypt_file(target, priv_key, overwrite_callback=thread_safe_overwrite_check)
+            out = self.encryptor.rsa_decrypt_file(target, priv_key, overwrite_callback=self._thread_safe_overwrite_check)
             self.signals.log_signal.emit(f"[+] Package successfully unlocked: {os.path.basename(out)}")
             self.signals.clear_inputs_signal.emit("rsa_dec")
         except InterruptedError as ie:
