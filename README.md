@@ -57,11 +57,39 @@ Ensure you have Python 3.10+ installed.
 
 ### Running the Application
 
-To launch the graphical interface from the source code:
+#### Graphical Interface (PyQt6)
 
 ```bash
 python gui.py
 ```
+
+#### Command-Line Interface (CLI)
+
+```bash
+# Encrypt / decrypt a file or directory
+python cli.py encrypt secret.pdf --shred
+python cli.py decrypt secret.pdf.enc
+
+# Generate passphrase-protected RSA-4096 keys & check fingerprint
+python cli.py keygen ./keys --protect
+python cli.py fingerprint ./keys/my_public_key.pem
+
+# Share a file or folder via Hybrid RSA + AES-256-GCM
+python cli.py rsa-encrypt ./project_folder --pub ./keys/my_public_key.pem
+python cli.py rsa-decrypt ./project_folder.zip.rsa.enc --priv ./keys/my_private_key.pem
+```
+
+### Running Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+---
+
+## 🛡️ Security & Threat Model
+
+See [THREAT_MODEL.md](THREAT_MODEL.md) for a detailed breakdown of protected assets, trust boundaries, implemented mitigations, and explicit out-of-scope residual risks (such as SSD wear-leveling and unauthenticated RSA senders).
 
 ---
 
